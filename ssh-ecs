@@ -1,0 +1,498 @@
+#!/usr/bin/env bash
+# ^for portability - see https://stackoverflow.com/questions/10376206/what-is-the-preferred-bash-shebang
+
+# Example usage:
+# ssh-ecs example-api-service --cluster dev --aws-profile example-aws-profile
+
+# ~/.ssh/config
+# Host example-bastion
+#     HostName example-host-name
+#     User ec2-user
+#     ForwardAgent yes
+#     IdentityFile ~/.ssh/example-pem.pem
+
+# ~/.bash_profile (or ~/.zprofile for zsh bois)
+# export PATH="$PATH:~/bin"
+#
+# alias ssh-ecs-dev="ssh-ecs --cluster dev --user root --aws-profile example-aws-profile --service-name example-api-service"
+# alias ssh-ecs-sandbox="ssh-ecs --cluster sandbox --user root --aws-profile example-aws-profile --service-name example-api-service"
+# alias ssh-ecs-staging="ssh-ecs --cluster staging --user root --aws-profile example-aws-profile --service-name example-api-service"
+# alias ssh-ecs-prod="ssh-ecs --cluster production --user root --aws-profile example-aws-profile --service-name example-api-service"
+#
+# ~/.ssh-ecs/config
+# ssh_bastion=example-bastion
+#
+# ^create config file with default config vars
+#
+#
+# example ssh-ecs profile
+# ~/.ssh-ecs/example-profile
+# user=root
+# cluster=dev
+# service_name=example-api-service
+# awscli_profile=example-aws-profile
+# aws_ecscli_profile=example-ecs-profile
+# aws_region=us-east-1
+#
+# ^create that file, then run ssh-ecs --profile example-profile
+
+set -o errexit
+set -o pipefail
+#set -o xtrace
+
+ME="$(basename "$0")"
+
+# config variables
+config_file=~/.ssh-ecs/config
+tmp_file=$(mktemp)
+cmd_cache_ttl=600 # 10 min
+cmd_cache_directory=~/.ssh-ecs/cache
+
+### default values for variables that may be affected by cli flags ###
+verbose_output=false
+info_output=false
+quiet_output=false
+cluster='dev'
+awscli_profile='default'
+aws_ecscli_profile='default'
+aws_region='us-east-1'
+interactive=true
+docker_exec_flags='-t -i '
+ssh_bastion='bastion'
+ssh_pem_path='~/.ssh/example-pem.pem'
+ssh_flags="-o StrictHostKeyChecking=no -t -i $ssh_pem_path -l ec2-user"
+select_all=false
+select_ip_number='1'
+force_recache=false
+profile=''
+service_name=''
+
+args=''
+
+function show_help {
+    echo "Usage: $ME [options] <container-regex> [cmd [arg ...]]"
+    echo ''
+    echo 'Perform commands on an AWS ECS container with `docker exec` executed over ssh'
+    echo ''
+    echo 'Options:'
+    echo '--cluster or -c:'
+    echo "    name of the container's ECS cluster (default: $cluster)"
+    echo '--region or -r:'
+    echo "    AWS region (default: $aws_region)"
+    echo '--aws-profile or -ap:'
+    echo '    AWS profile to use when invoking awscli and aws-ecscli commands'
+    echo '    (Omitting this flag will cause the default profile(s) to be used)'
+    echo '--select-all or -a:'
+    echo '    Execute command on all instances'
+    echo '--select-ip-number or -i:'
+    echo "    IP to use when the container regex returns multiple results (zero indexed array) (default: $select_ip_number)"
+    echo '--service-name or -s:'
+    echo '--container-regex or -r:'
+    echo '    Service name used in container regex'
+    echo '--ssh-bastion or -b:'
+    echo '    Bastion host to use from ~/.ssh/config file'
+    echo '--user or -u:'
+    echo '    Perform docker exec as specified user'
+    echo '--force-recache or -f:'
+    echo '    Skip the cache and fetch a fresh `container ps`'
+    echo '--profile or -p:'
+    echo '    Load ssh-ecs config from profile in ~/.ssh-ecs/ folder'
+    echo '--non-interactive or -n:'
+    echo '    override default flags of `-it` for `docker exec` and `-t` for `ssh(1)`'
+    echo '--info-output or -i:'
+    echo '    prints a minimal amount of info level messages to STDERR'
+    echo '    On by default in interactive mode, off in --non-interactive mode'
+    echo '--verboser or -v:'
+    echo '    output DEBUG info to STDERR, good for debugging'
+    echo ''
+}
+
+function echo_info {
+  if [ $quiet_output == true ]
+  then
+    return 0
+  fi
+
+  echo "$@"
+}
+
+function echo_verbose {
+  if [ $quiet_output == true ]
+  then
+    return 0
+  fi
+
+  if $verbose_output || $info_output
+  then
+    echo "$@" >&2
+  fi
+}
+
+# args: exit_status, err_msg [...]
+# 1st arg is the exit status to use
+# all other args are printed to STDERR
+function die_with_message {
+    exit_status="$1"
+    shift
+    echo "$@" >&2
+
+    # clean up
+    rm -f $tmp_file
+
+    exit $exit_status
+}
+
+function show_usage {
+    echo "Usage: $ME [options] container-regex [cmd [arg ...]]"
+}
+
+function check_dependencies {
+  # check if ecs-cli is installed (redirect STDOUT for silence on success, but servicing of error messages)
+  if ! command -v ecs-cli > /dev/null
+  then
+      die_with_message 1 '✋ 🛑  Please install the Amazon ecs-cli 🙅
+
+If you are on macOS, `brew install amazon-ecs-cli` is easiest.
+
+The Amazon instructions are also at:
+https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ECS_CLI_installation.html
+
+But those Amazon instructions are crap, friends never let friends use `sudo` to install _anything_ into the /usr/local tree'
+  fi
+}
+
+function parse_options {
+  # TODO: find a way to make it less painful to keep `StrictHostKeyChecking` turned on
+  # ssh-keyscan -H $private_ip >> ~/.ssh/known_hosts
+  # ^partial solution, not sure if it will work - see @https://askubuntu.com/questions/123072/ssh-automatically-accept-keys
+
+  # TODO: super lame to have these ssh flgags hard coded into the script
+
+  # ssh-ecs argument --option value
+  if [[ $1 != "--"* ]] && [[ $1 != "-"* ]]
+  then
+    service_name="$1"
+    shift
+  fi
+
+  while [[ $# -gt 0 ]]
+  do
+      case "$1" in
+          -h|--help)
+              show_usage
+              show_help
+              exit 0
+          ;;
+          -c|--cluster)
+              cluster="$2"
+              shift 2
+          ;;
+          -ap|--aws-profile)
+              awscli_profile="$2"
+              aws_ecscli_profile="$2" # whoever made these different in aws vs ecs-cli should be shot
+              shift 2
+          ;;
+          -r|--region)
+              aws_region="$2"
+              shift 2
+          ;;
+          -n|--non-interactive)
+              interactive=false
+              docker_exec_flags="$(printf '%s' "$docker_exec_flags" | sed -e 's/^-t -i //')"
+              ssh_flags="$(printf '%s' "$ssh_flags" | sed -e 's/^-t //')"
+              shift
+          ;;
+          -a|--select-all)
+              select_all=true
+              shift
+          ;;
+          -i|--select-ip-number)
+              select_ip_number="$2"
+              shift 2
+          ;;
+          -b|--ssh-bastion)
+              ssh_bastion="$2"
+              shift 2
+          ;;
+          -u|--user)
+              docker_exec_flags="$docker_exec_flags --user $2"
+              shift 2
+          ;;
+          -f|--force-recache)
+              force_recache=true
+              shift 1
+          ;;
+          --profile)
+              profile="$2"
+              shift 2
+          ;;
+          -s|--service-name)
+              service_name="$2"
+              shift 2
+          ;;
+          -cr|--container-regex)
+              service_name="$2"
+              shift 2
+          ;;
+          -v|--verbose)
+              quiet_output=false
+              verbose_output=true
+              shift
+          ;;
+          -i|--info-output)
+              quiet_output=false
+              info_output=true
+              shift
+          ;;
+          -q|--quiet)
+              quiet_output=true
+              ssh_flags="-o LogLevel=QUIET $ssh_flags"
+              shift
+          ;;
+          --) # end argument parsing
+              shift
+              break
+          ;;
+          -?|-*) # unsupported flags
+              if echo "$1" | grep -E --quiet '^--[a-z-]+=.+'
+              then
+                  die_with_message 1 "🔸 Error: $ME:" '`--option=value` style options are not supported, use `--option value`'
+              fi
+
+              if echo "$1" | grep -E --quiet '^-[a-z].+'
+              then
+                  die_with_message 1 "🔸 Error: $ME:" '`-oValue` style options are not supported, use `-o Value`'
+              fi
+
+              die_with_message 1 "🔸 Error: Unsupported flag '$1'" >&2
+          ;;
+          *) # we saw the last of the options, so GTFO and parse them args
+              break
+          ;;
+      esac
+  done
+
+  if [[ "$service_name" == "" ]]
+  then
+      die_with_message 1 "🔸 Error: $ME requires a container-regex argument"
+  fi
+
+  if [[ $# == 0 ]]
+  then
+      if ! $interactive
+      then
+          die_with_message 1 "🔸 Error: $ME: --non-interactive flag requires that a command be specified"
+      else
+          # default command is an interactive bash shell
+          set '/bin/bash'
+      fi
+  fi
+
+  args="$@"
+}
+
+function ssh_via_bastion {
+    ssh $ssh_flags -J $ssh_bastion -o LogLevel=QUIET "$@"
+}
+
+function get_cmd_cache_file {
+  mkdir -p $cmd_cache_directory
+  local append=$1
+  echo "$cmd_cache_directory/$cluster.$aws_region.$append.tmp"
+}
+
+# running `ecs-ps` takes a while, so lets cache it
+function fetch_cmd_from_cache {
+  local cmd=$1
+  local force_recache=$2
+  local cmd_hash=$(echo $cmd | md5)
+  local cmd_cache_file=$(get_cmd_cache_file "$cmd_hash")
+  local cmd_output=''
+  local fetch_from_cache=true
+
+  if [[ -f "$cmd_cache_file" ]]
+  then
+    local last_fetched_at=$(($(date +%s) - $(stat -f%c $cmd_cache_file)))
+
+    if [ "$last_fetched_at" -gt "$cmd_cache_ttl" ]
+    then
+        fetch_from_cache=false
+    fi
+  else
+    fetch_from_cache=false
+  fi
+
+  if [ $force_recache == true ]
+  then
+    fetch_from_cache=false
+  fi
+
+  if [ $fetch_from_cache == false ]
+  then
+    # @todo: don't write errors to cache file
+    cmd_output=$($cmd > $cmd_cache_file)
+  fi
+
+  echo $cmd_cache_file
+}
+
+function get_option {
+  local option=$1
+  shift;
+
+  # ssh-ecs argument --option value
+  if [[ $1 != "--"* ]] && [[ $1 != "-"* ]]
+  then
+    #service_name="$1"
+    shift
+  fi
+
+  while [[ $# -gt 0 ]]
+  do
+      case "$1" in
+          --$option)
+            echo $2
+            shift 2
+            break
+          ;;
+          --) # end argument parsing
+            shift
+          ;;
+          -?|-*)
+            shift
+          ;;
+          *) # we saw the last of the options, so GTFO and parse them args
+            shift
+            #break
+          ;;
+      esac
+  done
+}
+# At this point the args to pass as the command to `docker exec` are in "$@"
+
+check_dependencies
+
+# load vars from ssh-ecs config
+if [[ -f "$config_file" ]]
+then
+  source $config_file
+fi
+
+# was ssh-ecs profile specified?
+profile=$(get_option "profile" "$@")
+
+# load ssh-ecs profile
+
+if [ "$profile" != "" ]
+then
+  if [[ -f ~/.ssh-ecs/$profile ]]
+  then
+    source ~/.ssh-ecs/$profile
+  else
+    die_with_message 4 "Could not find ~/.ssh-ecs/$profile profile :("
+  fi
+fi
+
+parse_options "$@"
+
+# TODO: make a simple invocation of `ecs-cli` and test for 0 exit, just to confirm that --profile, --cluster, etc. are not an issue
+# TODO: make a simple invocation of `aws` and test for 0 exit, just to confirm that --profile and other configs are not an issue
+
+# "," => "|" - this allows us to filter for multiple services
+tmp_service_name=$(sed "s/,/| /g" <<< $service_name)
+
+# TODO: set pipefail to yes
+echo_info -n 'Fetching containers running specified service... '
+cmd_output_file=$(fetch_cmd_from_cache "ecs-cli ps --aws-profile $aws_ecscli_profile --region $aws_region --cluster $cluster --desired-status RUNNING" $force_recache)
+tasks=$(cat $cmd_output_file | grep RUNNING | grep -E " $tmp_service_name" | grep -v Name | awk '{print $1}'| cut -d '/' -f 1)
+
+#if [ $fetched_from_cache == true ]
+#then
+#  echo -n '(cached) '
+#fi
+echo_info 'done. 👏'
+
+if [ "$tasks" == "" ]
+then
+	die_with_message 2 "$ME: no containers matching the extended regular expression: '$service_name'"
+fi
+
+echo_info -n 'Fetching container instance ARN... '
+cmd_output_file=$(fetch_cmd_from_cache "aws ecs describe-tasks --profile $awscli_profile --region $aws_region --cluster $cluster --tasks $tasks" $force_recache)
+container_instance_arn=$(cat $cmd_output_file | grep containerInstanceArn | awk '{print $2}' | cut -d '/' -f 2 | cut -d '"' -f 1)
+echo_info 'done. 👏'
+
+echo_info -n 'Fetching container EC2 instance ID... '
+cmd_output_file=$(fetch_cmd_from_cache "aws ecs describe-container-instances --profile $awscli_profile --region $aws_region --cluster $cluster --container-instances $container_instance_arn" $force_recache)
+ec2_instance_id=$(cat $cmd_output_file | grep ec2InstanceId | awk '{print $2}' | cut -d '"' -f 2)
+echo_info 'done. 👏'
+
+echo_info -n 'Fetching Public and Private IP addrs... '
+cmd_output_file=$(fetch_cmd_from_cache "aws ec2 describe-instances --profile $awscli_profile --region $aws_region --instance-ids $ec2_instance_id --query "Reservations[].Instances[].PublicIpAddress" --output text" $force_recache)
+public_ip=$(cat $cmd_output_file)
+
+cmd_output_file=$(fetch_cmd_from_cache "aws ec2 describe-instances --profile $awscli_profile --region $aws_region --instance-ids $ec2_instance_id --query "Reservations[].Instances[].PrivateIpAddress" --output text" $force_recache)
+private_ip=$(cat $cmd_output_file)
+echo_info 'done. 👏'
+
+echo_verbose ''
+echo_verbose "Public IP: $public_ip"
+echo_verbose "Private IP: $private_ip"
+echo_verbose ''
+
+if [ $select_all == true ]
+then
+  echo_verbose "^we're going to connect to all instances"
+
+  private_ips=($(echo "$private_ip" | tr ' ' '\n'))
+else
+  if [[ $(echo $private_ip | wc -w) -gt 1 ]]
+  then
+    echo_verbose "^we'll connect to #$select_ip_number in the list 🤔"
+  fi
+
+  # "172.12.34.56 172.65.43.21 192.168.1.123" => "172.12.34.56"
+  private_ip=$(echo $private_ip | awk "{print \$$select_ip_number}")
+  private_ips=( "$private_ip" )
+fi
+
+for private_ip in "${private_ips[@]}"
+do
+  # Get the `docker ps`
+  ssh_via_bastion $private_ip docker ps > $tmp_file
+
+  echo_info -n 'Selecting the first container in filtered `docker ps` output... '
+
+  tmp_service_name=$(sed "s/,/|ecs-/g" <<< $service_name)
+  # Extract container id from filtered `docker ps` output
+  #container_id=$(grep -E "$tmp_service_name" "$tmp_file" | awk '{print $1}' | sed -n '1p')
+  container_ids=$(grep -E "$tmp_service_name" "$tmp_file" | awk '{print $1}')
+  container_ids=($(echo "$container_ids" | tr ' ' '\n'))
+
+  if [ "$container_ids" == "" ]
+  then
+    cat $tmp_file
+    die_with_message 3 '🔸 🧨 💥 Failed scraping container id from `docker ps` output 😢'
+  fi
+
+  echo_info 'done. 👏'
+
+  for container_id in "${container_ids[@]}"
+  do
+    echo_verbose ''
+    echo_verbose $(grep -E "$tmp_service_name" "$tmp_file")
+    echo_verbose ''
+    echo_verbose "Container ID: $container_id"
+
+    # Connect!
+    echo_verbose "Command: ssh $ssh_flags $private_ip /usr/bin/docker exec $docker_exec_flags $container_id $args"
+    echo_verbose ''
+    echo_info 'SSHing into docker container...🤝 keep those fingers crossed!🤞🙏🤞🙏🤞'
+    echo_info ''
+
+    ssh_via_bastion $private_ip /usr/bin/docker exec $docker_exec_flags $container_id "$args"
+  done
+
+  # clean up
+  rm -f $tmp_file
+done
