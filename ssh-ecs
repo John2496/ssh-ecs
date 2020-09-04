@@ -105,6 +105,7 @@ Options:
     On by default in interactive mode, off in --non-interactive mode
 --verboser or -v:
     output DEBUG info to STDERR, good for debugging
+
 EOF
 }
 
