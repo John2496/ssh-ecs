@@ -70,41 +70,43 @@ service_name=''
 args=''
 
 function show_help {
-    echo "Usage: $ME [options] <container-regex> [cmd [arg ...]]"
-    echo ''
-    echo 'Perform commands on an AWS ECS container with `docker exec` executed over ssh'
-    echo ''
-    echo 'Options:'
-    echo '--cluster or -c:'
-    echo "    name of the container's ECS cluster (default: $cluster)"
-    echo '--region or -r:'
-    echo "    AWS region (default: $aws_region)"
-    echo '--aws-profile or -ap:'
-    echo '    AWS profile to use when invoking awscli and aws-ecscli commands'
-    echo '    (Omitting this flag will cause the default profile(s) to be used)'
-    echo '--select-all or -a:'
-    echo '    Execute command on all instances'
-    echo '--select-ip-number or -i:'
-    echo "    IP to use when the container regex returns multiple results (zero indexed array) (default: $select_ip_number)"
-    echo '--service-name or -s:'
-    echo '--container-regex or -r:'
-    echo '    Service name used in container regex'
-    echo '--ssh-bastion or -b:'
-    echo '    Bastion host to use from ~/.ssh/config file'
-    echo '--user or -u:'
-    echo '    Perform docker exec as specified user'
-    echo '--force-recache or -f:'
-    echo '    Skip the cache and fetch a fresh `container ps`'
-    echo '--profile or -p:'
-    echo '    Load ssh-ecs config from profile in ~/.ssh-ecs/ folder'
-    echo '--non-interactive or -n:'
-    echo '    override default flags of `-it` for `docker exec` and `-t` for `ssh(1)`'
-    echo '--info-output or -i:'
-    echo '    prints a minimal amount of info level messages to STDERR'
-    echo '    On by default in interactive mode, off in --non-interactive mode'
-    echo '--verboser or -v:'
-    echo '    output DEBUG info to STDERR, good for debugging'
-    echo ''
+cat << EOF
+Usage: $ME [options] <container-regex> [cmd [arg ...]]
+
+Perform commands on an AWS ECS container with \`docker exec\` executed over ssh
+
+Options:
+--cluster or -c:
+    name of the containers ECS cluster (default: $cluster)
+--region or -r:
+    AWS region (default: $aws_region)
+--aws-profile or -ap:
+    AWS profile to use when invoking awscli and aws-ecscli commands
+    (Omitting this flag will cause the default profile(s) to be used)
+--select-all or -a:
+    Execute command on all instances
+--select-ip-number or -i:
+    IP to use when the container regex returns multiple results (zero indexed array) (default: $select_ip_number)
+--service-name or -s:
+--container-regex or -r:
+    Service name used in container regex
+--ssh-bastion or -b:
+    Bastion host to use from ~/.ssh/config file
+--user or -u:
+    Perform docker exec as specified user
+--force-recache or -f:
+    Skip the cache and fetch a fresh `container ps`
+--profile or -p:
+    Load ssh-ecs config from profile in ~/.ssh-ecs/ folder
+--non-interactive or -n:
+    override default flags of \`-it\` for \`docker exec\` and \`-t\` for \`ssh(1)\`
+--info-output or -i:
+    prints a minimal amount of info level messages to STDERR
+    On by default in interactive mode, off in --non-interactive mode
+--verboser or -v:
+    output DEBUG info to STDERR, good for debugging
+
+EOF
 }
 
 function echo_info {
